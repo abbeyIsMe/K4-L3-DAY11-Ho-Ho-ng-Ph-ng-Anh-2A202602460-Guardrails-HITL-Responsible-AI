@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,8 +43,89 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Ký tự nhìn giống chữ Latin (Cyrillic) hay dùng để lách regex
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c",
+    "і": "i", "ѕ": "s", "у": "y", "х": "x", "ѵ": "v",
+})
+
+
+def _canonicalize(text: str) -> str:
+    """Chuẩn hoá chuỗi trước khi so khớp regex.
+
+    - NFKC: đưa chữ full-width / ký tự tương thích về dạng thường
+    - Xoá ký tự ẩn (zero-width, soft hyphen, bidi... = Unicode category "Cf")
+    - Đổi homoglyph Cyrillic -> Latin
+    - Bỏ dấu tiếng Việt (để bắt "bỏ qua hướng dẫn" dù gõ có/không dấu)
+    - Về chữ thường, gộp khoảng trắng
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = text.translate(_HOMOGLYPHS)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = re.sub(r"\s+", " ", text)
+    return text.lower().strip()
+
+
+_FILLER = r"(?:all\s+|any\s+|the\s+|your\s+|my\s+|every\s+)*"
+_QUALIFIER = r"(?:previous\s+|prior\s+|above\s+|earlier\s+|system\s+|safety\s+|initial\s+)*"
+
+INJECTION_PATTERNS = [
+    # 1. ignore / disregard / forget / override ... instructions
+    r"\b(?:ignore|disregard|forget|override|bypass)\b\s+" + _FILLER + _QUALIFIER
+    + r"(?:instructions?|rules?|prompts?|guidelines?|restrictions?|directives?)",
+    # 2. đổi vai / gán persona mới
+    r"\byou\s+are\s+now\b",
+    r"\bfrom\s+now\s+on\b[^.?!]{0,40}\b(?:you|act|behave|answer)\b",
+    # 3. system prompt
+    r"\bsystem\s+prompt\b",
+    # 4. đòi lộ prompt / cấu hình / secret
+    r"\breveal\b[^.?!]{0,30}\b(?:instructions?|prompt|configuration|secrets?|credentials?|password)\b",
+    r"\b(?:show|print|repeat|display|tell|give|output|share|leak|expose|disclose|translate)\b"
+    r"[^.?!]{0,25}\b(?:your|its|internal|hidden|secret|system|admin|initial)\s+(?:\w+\s+)?"
+    r"(?:instructions?|prompt|configuration|password|credentials?|api[\s_-]?key|secrets?)\b",
+    # 5. giả vờ / roleplay không giới hạn
+    r"\bpretend\s+(?:that\s+)?(?:you\s+are|you're|to\s+be)\b",
+    r"\bact\s+as\s+(?:a\s+|an\s+)?(?:unrestricted|unfiltered|uncensored|jailbroken|evil|dan\b)",
+    r"\b(?:jailbreak|developer\s+mode|dan\s+mode|do\s+anything\s+now)\b",
+    r"\b(?:without|no)\s+(?:any\s+)?(?:restrictions?|filters?|limits?|rules|guardrails?)\b",
+    # 6. hỏi thẳng secret nội bộ
+    r"\b(?:admin|root|internal|database|db)\s+(?:password|passwd|credentials?|host|api[\s_-]?key)\b",
+    # 7. giả mạo thẻ / delimiter hệ thống trong email / RAG
+    r"</?\s*(?:system|instructions?)\s*>|\[/?\s*(?:inst|system)\s*\]|<\|im_(?:start|end)\|>",
+    # 8. tiếng Việt (đã bỏ dấu ở _canonicalize)
+    r"\bbo\s+qua\s+(?:tat\s+ca\s+|moi\s+|cac\s+)*(?:huong\s+dan|chi\s+thi|quy\s+tac|lenh)",
+    r"\btiet\s+lo\s+(?:system\s+prompt|huong\s+dan|prompt|mat\s+khau)",
+    r"\bmat\s+khau\s+(?:admin|quan\s+tri|he\s+thong|noi\s+bo)",
+    r"\bgia\s+vo\s+(?:la|ban\s+la)\b",
+]
+
+# Bắt kiểu tách chữ để lách: "i g n o r e  a l l ..." (so trên chuỗi đã bỏ hết ký tự không phải chữ/số)
+_COMPACT_SIGNALS = (
+    "ignoreallpreviousinstructions",
+    "ignorepreviousinstructions",
+    "ignoreallinstructions",
+    "ignoreyourinstructions",
+    "revealsystemprompt",
+    "revealyourprompt",
+    "youarenowdan",
+)
+
+_COMPILED_INJECTION = [re.compile(p) for p in INJECTION_PATTERNS]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
+
+    Nhiều lớp tín hiệu (regex chỉ là một lớp, không phải toàn bộ ranh giới bảo mật):
+      1. Chuẩn hoá Unicode (bỏ ký tự ẩn, homoglyph, dấu tiếng Việt).
+      2. Regex cụm tấn công phổ biến (EN + VI).
+      3. Kiểm tra dạng "tách chữ" (i-g-n-o-r-e ...).
+
+    Câu banking bình thường, hoặc yêu cầu tóm tắt email chuyển khoản bên ngoài
+    (không chứa lệnh tấn công) -> vẫn "ALLOW".
 
     Args:
         user_input: The user's message
@@ -51,15 +133,16 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    text = _canonicalize(user_input)
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    for pattern in _COMPILED_INJECTION:
+        if pattern.search(text):
             return "BLOCK"
+
+    compact = re.sub(r"[^a-z0-9]", "", text)
+    if any(signal in compact for signal in _COMPACT_SIGNALS):
+        return "BLOCK"
+
     return "ALLOW"
 
 
@@ -74,6 +157,13 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
+def _topic_hit(text: str, topics) -> bool:
+    """True nếu có topic xuất hiện ở đầu một từ (tránh 'skill' dính 'kill')."""
+    return any(
+        re.search(r"(?<![a-z0-9])" + re.escape(t.lower()), text) for t in topics
+    )
+
+
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
 
@@ -84,14 +174,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    # Bỏ dấu để "tài khoản" khớp với "tai khoan" trong ALLOWED_TOPICS
+    text = _canonicalize(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Có topic cấm -> BLOCK
+    if _topic_hit(text, BLOCKED_TOPICS):
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Không dính topic banking nào (kể cả chuỗi rỗng) -> BLOCK
+    if not _topic_hit(text, ALLOWED_TOPICS):
+        return "BLOCK"
+
+    # 3. Câu banking hợp lệ
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +239,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Lớp 1: prompt injection / jailbreak
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu bị từ chối: nội dung có dấu hiệu tấn công / cố lấy thông tin nội bộ. "
+                "(Request blocked: possible prompt injection.) "
+                "Mình chỉ hỗ trợ các câu hỏi về ngân hàng."
+            )
 
-        pass  # Replace with your implementation
+        # Lớp 2: chỉ trả lời chủ đề ngân hàng
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Mình chỉ hỗ trợ các vấn đề ngân hàng như tài khoản, giao dịch, "
+                "tiết kiệm, khoản vay, lãi suất, thẻ tín dụng. "
+                "(I can only help with banking topics.)"
+            )
+
+        # Cả hai ALLOW -> cho qua LLM
+        return None
 
 
 # ============================================================
@@ -207,7 +314,7 @@ async def test_input_plugin():
         status = "BLOCK" if result else "ALLOW"
         print(f"  [{status}] '{msg[:60]}'")
         if result and result.parts:
-            print(f"           -> {result.parts[0].text[:80]}")
+            print(f"           -> {(result.parts[0].text or '')[:80]}")
     print(f"\nStats: {plugin.blocked_count} blocked / {plugin.total_count} total")
 
 

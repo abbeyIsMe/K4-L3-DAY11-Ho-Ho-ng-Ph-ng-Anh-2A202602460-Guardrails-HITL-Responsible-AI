@@ -1,0 +1,23 @@
+{
+  "total_requests": 39,
+  "blocked_requests": 22,
+  "block_rate": 0.5641025641025641,
+  "rate_limit_hits": 10,
+  "judge_checks": 0,
+  "judge_fails": 0,
+  "judge_fail_rate": 0.0,
+  "alerts": [
+    {
+      "metric": "block_rate",
+      "value": 0.5641,
+      "threshold": 0.5,
+      "message": "Block rate 56% vượt ngưỡng 50% — có thể đang bị tấn công."
+    },
+    {
+      "metric": "rate_limit_hits",
+      "value": 10,
+      "threshold": 5,
+      "message": "10 lần bị rate limit, vượt ngưỡng 5 — nghi spam / flooding."
+    }
+  ]
+}
